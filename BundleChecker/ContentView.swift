@@ -9,12 +9,14 @@ import MachO
 // ========================================================================
 
 // 定义 C 函数指针类型
+// 【修复 1】: 将 CFBundleRef 改为 UnsafeRawPointer，避免 Swift 类型重命名问题
+typealias CFBundleGetIdFunc = @convention(c) (UnsafeRawPointer) -> CFString?
+
 typealias SecTaskCreateFunc = @convention(c) (CFAllocator?) -> Unmanaged<AnyObject>?
 typealias SecTaskCopyIdFunc = @convention(c) (AnyObject, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFString?
-typealias CFBundleGetIdFunc = @convention(c) (CFBundleRef) -> CFString?
 typealias MethodGetImpFunc = @convention(c) (Method) -> IMP
 
-// 核心工具：通过 dlsym 获取真实系统函数地址，绕过 Fishhook
+// 核心工具：通过 dlsym 获取真实系统函数地址
 func getRealFunction<T>(_ symbol: String, _ type: T.Type) -> T? {
     let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
     guard let addr = dlsym(RTLD_DEFAULT, symbol) else { return nil }
@@ -69,7 +71,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("BundleID 破壁检测 V11")
+            Text("BundleID 破壁检测 V12")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity)
@@ -134,7 +136,7 @@ struct ContentView: View {
     func performAllChecks() {
         var items: [ResultItem] = []
         
-        // --- 1. OC API (这里肯定会被你 Hook) ---
+        // --- 1. OC API ---
         let nsID = Bundle.main.bundleIdentifier ?? "nil"
         items.append(ResultItem(
             method: "1. [OC API] Bundle.main",
@@ -144,7 +146,6 @@ struct ContentView: View {
         ))
         
         // --- 2. C API (穿透 Fishhook) ---
-        // 你 Hook 了 CFBundleGetIdentifier，但我用 dlsym 调真的
         let cfID = getRealCFBundleID()
         items.append(ResultItem(
             method: "2. [C API] dlsym(CF...)",
@@ -154,7 +155,6 @@ struct ContentView: View {
         ))
         
         // --- 3. IO (穿透 fopen Hook) ---
-        // 你 Hook 了 fopen，我用 POSIX open/read
         let posixID = getBundleIDUsingPosix()
         items.append(ResultItem(
             method: "3. [IO] POSIX open/read",
@@ -164,7 +164,6 @@ struct ContentView: View {
         ))
         
         // --- 4. 内核层 (穿透 SecTask Hook) ---
-        // 你 Hook 了 SecTaskCopySigningIdentifier，我用 dlsym 调真的
         let kernelID = getRealSecTaskID()
         let cleanKernelID = stripTeamID(kernelID)
         items.append(ResultItem(
@@ -175,8 +174,8 @@ struct ContentView: View {
         ))
         
         // --- 5. 交叉验证 (授权 vs 证书) ---
-        let entID = getEntitlementsAppID() // 这个也会走 dlsym
-        let provID = getMobileProvisionID() // 走 POSIX 读取
+        let entID = getEntitlementsAppID()
+        let provID = getMobileProvisionID()
         
         let isSignatureConsistent = (provID == entID) || provID.contains(entID) || entID.contains(provID)
         let entStatus: Status = (entID.contains("Fail") || entID.contains("Found")) ? .info : (isSignatureConsistent ? .safe : .suspicious)
@@ -197,7 +196,6 @@ struct ContentView: View {
         ))
         
         // --- 6. Runtime 完整性 (穿透 method_getImplementation 欺骗) ---
-        // 你拦截了获取 IMP 的请求，但我用 dlsym 拿到真的获取器，查你的底
         let (rtStatus, rtMsg) = checkRealRuntimeIntegrity()
         items.append(ResultItem(
             method: "7. [Runtime] 深度反 Hook",
@@ -216,11 +214,16 @@ struct ContentView: View {
     // 2. 穿透版 CFBundle
     func getRealCFBundleID() -> String {
         // 使用 dlsym 找到真正的 CFBundleGetIdentifier
-        // 你的 Fishhook 只能修改主程序的符号表，改不了 CoreFoundation 内部的地址
         if let realFunc = getRealFunction("CFBundleGetIdentifier", CFBundleGetIdFunc.self) {
-            let mainBundle = CFBundleGetMainBundle()
-            if let cfStr = realFunc(mainBundle) {
-                return cfStr as String
+            // 【修复 2】: 解包 Optional 的 MainBundle
+            if let mainBundle = CFBundleGetMainBundle() {
+                // 【修复 3】: 将 CFBundle 对象转换为 UnsafeRawPointer 传递给 C 函数
+                // 这样绕过了 "CFBundle renamed to CFBundleRef" 的类型兼容性问题
+                let bundlePtr = Unmanaged.passUnretained(mainBundle).toOpaque()
+                
+                if let cfStr = realFunc(bundlePtr) {
+                    return cfStr as String
+                }
             }
         }
         return "Fail (dlsym)"
@@ -230,24 +233,21 @@ struct ContentView: View {
     func getBundleIDUsingPosix() -> String {
         guard let path = Bundle.main.path(forResource: "Info", ofType: "plist") else { return "No Path" }
         
-        // 使用 open 系统调用，你的 fopen hook 对此无效
+        // 使用 open 系统调用
         let fd = open(path, O_RDONLY)
         if fd == -1 { return "Open Fail" }
         defer { close(fd) }
         
-        // 获取文件大小
         let size = lseek(fd, 0, SEEK_END)
         lseek(fd, 0, SEEK_SET)
         
         if size <= 0 { return "Empty" }
         
-        // 读取内容
         var buffer = [CChar](repeating: 0, count: Int(size) + 1)
         let bytesRead = read(fd, &buffer, Int(size))
         
         if bytesRead > 0 {
             let content = String(cString: buffer)
-            // 简单解析
             if let range = content.range(of: "CFBundleIdentifier") {
                 let sub = content[range.upperBound...]
                 if let start = sub.range(of: "<string>"), let end = sub.range(of: "</string>") {
@@ -260,7 +260,6 @@ struct ContentView: View {
     
     // 4. 穿透版 SecTask
     func getRealSecTaskID() -> String {
-        // dlsym 绕过 SecTaskCopySigningIdentifier 的 Hook
         if let createFunc = getRealFunction("SecTaskCreateFromSelf", SecTaskCreateFunc.self),
            let copyFunc = getRealFunction("SecTaskCopySigningIdentifier", SecTaskCopyIdFunc.self) {
             
@@ -276,7 +275,6 @@ struct ContentView: View {
     
     // 5. 穿透版 Entitlements
     func getEntitlementsAppID() -> String {
-        // 同样用 dlsym 绕过
         typealias CopyEntFunc = @convention(c) (AnyObject, CFString, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFTypeRef?
         
         if let createFunc = getRealFunction("SecTaskCreateFromSelf", SecTaskCreateFunc.self),
@@ -299,7 +297,6 @@ struct ContentView: View {
             return "未找到"
         }
         
-        // 使用 open 而不是 Data(contentsOf:)，防止 Data 被 Hook
         let fd = open(path, O_RDONLY)
         if fd == -1 { return "Read Error" }
         defer { close(fd) }
@@ -310,7 +307,6 @@ struct ContentView: View {
         var buffer = [UInt8](repeating: 0, count: Int(size))
         read(fd, &buffer, Int(size))
         
-        // 转 String (Latin1)
         if let content = String(bytes: buffer, encoding: .isoLatin1) {
             if let range = content.range(of: "<key>application-identifier</key>") {
                 let sub = content[range.upperBound...]
@@ -322,44 +318,39 @@ struct ContentView: View {
         return "Parse Fail"
     }
     
-    // 7. 真实 Runtime 检测 (破解你的 method_getImplementation 欺骗)
+    // 7. 真实 Runtime 检测
     func checkRealRuntimeIntegrity() -> (Bool, String) {
         let selector = #selector(getter: Bundle.bundleIdentifier)
         guard let method = class_getInstanceMethod(Bundle.self, selector) else {
             return (false, "Method Missing")
         }
         
-        // 🚨 关键反制：
-        // 你 Hook 了 C 函数 method_getImplementation 来返回假地址。
-        // 但我用 dlsym 获取真正的 method_getImplementation 函数地址！
-        // 然后用这个真的函数去查 Method，就会拿到你 Swizzle 后的【真实恶意 IMP】。
-        
         guard let realGetImp = getRealFunction("method_getImplementation", MethodGetImpFunc.self) else {
             return (false, "dlsym Fail")
         }
         
-        // 调用真正的 getter，拿到被 Swizzle 的 IMP
         let realImp = realGetImp(method)
         
-        // 检查这个 IMP 到底在哪
-        var info = Local_Dl_info()
-        // 动态获取 dladdr 防止被 hook
-        typealias DlAddrFunc = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<Local_Dl_info>) -> Int32
+        // 【修复 4】: 第二个参数类型改为 UnsafeMutableRawPointer (裸指针)
+        // 避开 Swift 结构体不支持 @convention(c) 的问题
+        typealias DlAddrFunc = @convention(c) (UnsafeRawPointer, UnsafeMutableRawPointer) -> Int32
         
+        var info = Local_Dl_info()
         guard let dladdrPtr = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "dladdr") else {
             return (false, "No dladdr")
         }
         let dladdrFunc = unsafeBitCast(dladdrPtr, to: DlAddrFunc.self)
         
         let impPtr = UnsafeRawPointer(realImp)
-        if dladdrFunc(impPtr, &info) != 0 {
+        // 【修复 5】: 调用时将 &info 转换为裸指针
+        let infoRaw = UnsafeMutableRawPointer(&info)
+        
+        if dladdrFunc(impPtr, infoRaw) != 0 {
             if let fnamePtr = info.dli_fname {
                 let fname = String(cString: fnamePtr)
-                // 如果 IMP 在 CoreFoundation，说明没被 Swizzle
                 if fname.contains("CoreFoundation") || fname.contains("Foundation") {
                     return (true, "System Framework")
                 } else {
-                    // 如果 IMP 在你的 dylib 里，或者 unknown，就是被 Hook 了
                     let libName = URL(fileURLWithPath: fname).lastPathComponent
                     return (false, "Hooked by: \(libName)")
                 }
